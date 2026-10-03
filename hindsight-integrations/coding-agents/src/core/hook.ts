@@ -20,6 +20,7 @@
  * in `buildHookOutput` (client + cache file in, injection string out) so it's unit-testable
  * without stdin/stdout; `runHook` is thin plumbing around it, with a `makeClient` seam for tests.
  */
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { deriveBankIdOrSkip } from "./bank";
 import type { Config } from "./config";
@@ -41,10 +42,15 @@ import {
 import type { PageRef } from "./knowledge-injection";
 import { buildRosterRefresh, parsePageList } from "./knowledge-injection";
 import {
+  clearReflectJob,
+  readReflectJob,
   readSessionCache,
+  reflectJobFile,
   sessionCacheFile,
   sessionRootDir,
+  writeReflectJob,
   writeSessionCache,
+  type ReflectJob,
   type SessionCache,
 } from "./session-cache";
 import { appendJournalTurn, journalPath } from "./turn-journal";
@@ -93,6 +99,67 @@ interface HookClient {
  *  turns, not time: each retry costs another full attempt (up to `reflectTimeoutMs` on the
  *  reflect path), so a dead server spends this many turns before every later turn is free. */
 const HOOK_INJECT_ATTEMPTS = 2;
+
+/** argv flag that turns a prompt-hook binary into the reflect worker (see `runReflectWorker`). */
+export const REFLECT_WORKER_FLAG = "--reflect-worker";
+/** How long the worker keeps one synthesis alive. Well past any hook window, short of forever. */
+const LATE_REFLECT_TIMEOUT_MS = 120_000;
+/** A pending job older than this has no live worker behind it; stop waiting for it. */
+const LATE_REFLECT_MAX_AGE_MS = LATE_REFLECT_TIMEOUT_MS + 30_000;
+/** Opens a synthesis delivered on a later prompt, so the agent reads it against the right goal. */
+export const LATE_REFLECT_LEAD =
+  "(This synthesis was written for the request that opened this session. It was not ready in time " +
+  "for that turn and is arriving now.)";
+
+/**
+ * Runs the first-prompt synthesis in a process that outlives the hook, so a synthesis slower than
+ * `reflectTimeoutMs` is delivered on a later prompt instead of being discarded. Supplied by
+ * `runHook` on the hook harnesses; absent (persistent-plugin harnesses, tests) the hook reflects
+ * in-process exactly as before.
+ */
+export interface LateReflect {
+  /** Record the job and start the worker. False = could not start; reflect in-process instead. */
+  start(request: { query: string; budget: string }): boolean;
+  read(): ReflectJob | undefined;
+  clear(): void;
+  /** How often the hook looks for the worker's answer while it waits. */
+  pollMs?: number;
+}
+
+/** The worker is still writing the synthesis when the hook's own deadline passes. A timeout as far
+ *  as this turn is concerned (so the retrieval fallback runs), but not a lost answer. */
+class ReflectPendingError extends ReflectError {
+  constructor(timeoutMs: number) {
+    super(
+      `reflect still running after ${timeoutMs}ms; it will be delivered on a later prompt`,
+      undefined,
+      true
+    );
+    this.name = "ReflectPendingError";
+  }
+}
+
+/** Start the worker and wait for its answer until the hook's deadline. */
+async function reflectViaWorker(late: LateReflect, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const job = late.read();
+    if (job?.state === "ready") {
+      late.clear();
+      return job.answer ?? "";
+    }
+    if (!job || job.state === "failed") {
+      late.clear();
+      throw new ReflectError(
+        job?.error ?? "reflect worker left no result",
+        job?.status,
+        job?.timedOut === true
+      );
+    }
+    if (Date.now() >= deadline) throw new ReflectPendingError(timeoutMs);
+    await new Promise((resolve) => setTimeout(resolve, late.pollMs ?? 200));
+  }
+}
 
 /**
  * What to cache for a once-per-session auto-injection, given what the source returned.
@@ -201,8 +268,10 @@ export async function buildHookOutput(args: {
   cfg: Config;
   client: HookClient;
   cacheFile: string;
+  /** Present on the hook harnesses: lets a slow synthesis be delivered on a later prompt. */
+  lateReflect?: LateReflect;
 }): Promise<HookOutput> {
-  const { harness, prompt, cfg, client, cacheFile } = args;
+  const { harness, prompt, cfg, client, cacheFile, lateReflect } = args;
 
   const cached = readSessionCache(cacheFile);
   const turns = (cached.turns ?? 0) + 1;
@@ -222,6 +291,38 @@ export async function buildHookOutput(args: {
   let reflectFailed = false;
   // Set when reflect timed out / 5xx'd and a retrieval-only fallback supplied the memory instead.
   let fallback: string | null | undefined;
+  // ── a synthesis an earlier prompt's hook could not wait for ───────────────────
+  // The worker has had the user's whole turn to finish. Delivered once, here, or dropped for good
+  // if the worker failed or died.
+  let reflectPending = cached.reflectPending === true;
+  let lateAnswer: string | undefined;
+  if (reflectPending && lateReflect) {
+    const job = lateReflect.read();
+    if (job?.state === "ready") {
+      lateAnswer = job.answer || undefined;
+      diag(harness, job.answer ? "reflect_late_ok" : "reflect_late_empty", {
+        ms: job.ms,
+        chars: (job.answer ?? "").length,
+        answer: (job.answer ?? "").slice(0, 8000),
+      });
+      lateReflect.clear();
+      reflectPending = false;
+    } else if (
+      !job ||
+      job.state === "failed" ||
+      Date.now() - job.startedAt > LATE_REFLECT_MAX_AGE_MS
+    ) {
+      diag(harness, "reflect_late_failed", {
+        bank: client.bank,
+        error: job?.error ?? "worker left no result",
+      });
+      lateReflect.clear();
+      reflectPending = false;
+    }
+  } else if (reflectPending) {
+    reflectPending = false; // nothing can deliver it in this process
+  }
+
   const deferInitialReflect = cached.deferInitialReflect === true;
   if (deferInitialReflect) {
     // A new bank has no useful history yet. Do not burn the once-per-session synthesis on prompt
@@ -265,13 +366,13 @@ export async function buildHookOutput(args: {
     // the hook harnesses) must raise that too — see the README's reflectTimeoutMs row.
     const timeoutMs = cfg.reflectTimeoutMs;
     try {
-      reflectAnswer = await client.reflect(buildReflectQuery(prompt), {
-        // Automatic reflection runs inside the host's hook window. Hindsight's low budget is the
-        // supported default for bounded reflect calls; callers that explicitly invoke the MCP
-        // tool still get the deeper high-budget path.
-        budget: "low",
-        timeoutMs,
-      });
+      // Automatic reflection runs inside the host's hook window. Hindsight's low budget is the
+      // supported default for bounded reflect calls; callers that explicitly invoke the MCP
+      // tool still get the deeper high-budget path.
+      const query = buildReflectQuery(prompt);
+      reflectAnswer = lateReflect?.start({ query, budget: "low" })
+        ? await reflectViaWorker(lateReflect, timeoutMs)
+        : await client.reflect(query, { budget: "low", timeoutMs });
       diag(harness, reflectAnswer ? "reflect_ok" : "reflect_empty", {
         ms: Date.now() - t0,
         chars: reflectAnswer.length,
@@ -285,12 +386,18 @@ export async function buildHookOutput(args: {
       // budget is spent. Caching "" here meant one timeout on the session's first prompt disabled
       // synthesis for the ENTIRE session, and against a real server a reflect near the timeout is a
       // coin flip, not an edge case (#4607).
-      reflectAnswer = resolveInjection(undefined, reflectAttempts);
-      reflectFailed = true;
-      log.warn(harness, "reflect failed — session runs without memory", {
-        error: describeError(e),
-      });
-      diag(harness, "reflect_failed", {
+      //
+      // Still running in the worker is neither: the answer is on its way, so this turn must not
+      // schedule a second reflect (resolved as "") and a later prompt delivers it.
+      reflectPending = e instanceof ReflectPendingError;
+      reflectAnswer = reflectPending ? "" : resolveInjection(undefined, reflectAttempts);
+      reflectFailed = !reflectPending;
+      if (!reflectPending) {
+        log.warn(harness, "reflect failed — session runs without memory", {
+          error: describeError(e),
+        });
+      }
+      diag(harness, reflectPending ? "reflect_pending" : "reflect_failed", {
         ms: Date.now() - t0,
         bank: client.bank,
         timeoutMs,
@@ -331,6 +438,7 @@ export async function buildHookOutput(args: {
     turns,
     reflectAnswer,
     reflectAttempts,
+    ...(reflectPending ? { reflectPending: true } : {}),
     pages: { atTurn: stale ? turns : (cached.pages?.atTurn ?? turns), list: pages },
   } satisfies SessionCache);
 
@@ -341,6 +449,8 @@ export async function buildHookOutput(args: {
   // as random noise once the session drifts, and the agent holds hindsight_reflect for a FRESH
   // pass if compaction or drift makes it need memory again.
   if (reflectAnswer && reflectRanThisTurn) blocks.push(buildSystemInjection(reflectAnswer));
+  // The late synthesis follows the same once-only rule, one prompt (or more) after it was asked for.
+  if (lateAnswer) blocks.push(buildSystemInjection(`${LATE_REFLECT_LEAD}\n\n${lateAnswer}`));
   // Knowledge pages are NOT auto-injected: the agent pulls them through
   // hindsight_search_knowledge_pages when a question warrants it — an unprompted injection on
   // every turn (even a plain "yes") read as phantom research. The roster below keeps the tool
@@ -359,7 +469,14 @@ export async function buildHookOutput(args: {
   // showing its assigned goal and a preview of what came back. Ordinary turns stay silent — page
   // knowledge is pulled via the hindsight_search_knowledge_pages tool, a visible tool call.
   let notice: string | undefined;
-  if (fallback) {
+  if (lateAnswer) {
+    const preview = lateAnswer.replace(/\s+/g, " ").trim();
+    notice =
+      `${brandWord()} · memory for this session's opening goal arrived late — added now\n` +
+      `↳ ${preview.length > 140 ? `${preview.slice(0, 140)}…` : preview}`;
+  } else if (reflectPending && reflectRanThisTurn && !fallback) {
+    notice = `${brandWord()} · memory is still being written — it will be added on your next prompt`;
+  } else if (fallback) {
     // Silent: the session still got memory, just not a synthesis. The notice used to say which
     // source answered and point at the diag file, but that read as an error on a turn that
     // worked; reflect_failed + reflect_fallback_* in the diag trail carry the details.
@@ -385,11 +502,100 @@ export async function buildHookOutput(args: {
   return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages };
 }
 
+/**
+ * The reflect worker: the same hook binary, re-executed detached with `REFLECT_WORKER_FLAG`. It
+ * makes the one reflect call the job describes and records the outcome in the job file. Never
+ * throws and never writes to stdout — nothing is listening.
+ */
+export async function runReflectWorker(
+  jobFile: string,
+  makeClient: (opts: ClientOpts) => HookClient = (o) => new HindsightClient(o)
+): Promise<void> {
+  const job = readReflectJob(jobFile);
+  const request = job?.request;
+  if (!job || job.state !== "pending" || !request) return;
+  const t0 = Date.now();
+  const record = (outcome: Partial<ReflectJob>) => {
+    try {
+      writeReflectJob(jobFile, { ...job, ...outcome });
+    } catch {
+      /* the hook treats a job that never resolves as failed once it is too old */
+    }
+  };
+  try {
+    const cfg = loadConfig({ harness: request.harness });
+    setLogLevel(cfg.logLevel);
+    const client = makeClient({
+      apiUrl: request.apiUrl,
+      apiToken: cfg.apiToken,
+      bank: request.bank,
+    });
+    const answer = await client.reflect(request.query, {
+      budget: request.budget,
+      timeoutMs: LATE_REFLECT_TIMEOUT_MS,
+    });
+    record({ state: "ready", answer, ms: Date.now() - t0 });
+  } catch (e) {
+    record({
+      state: "failed",
+      ms: Date.now() - t0,
+      error: describeError(e, 1500),
+      status: e instanceof ReflectError ? e.status : undefined,
+      timedOut: e instanceof ReflectError ? e.timedOut : undefined,
+    });
+  }
+}
+
+/** File-backed `LateReflect` for one session: the job file sits beside the session cache and the
+ *  worker is this same binary. `spawnFn` is injectable for tests. */
+export function fileLateReflect(
+  cacheFile: string,
+  target: { harness: string; apiUrl: string; bank: string },
+  spawnFn: typeof spawn = spawn
+): LateReflect | undefined {
+  // Only a bundled hook binary (`claude-hook.js`, `codex-hook.js`, …) can be re-executed as the
+  // worker. Anything else — a test runner, a host that imports this module — reflects in-process.
+  const script = process.argv[1];
+  if (!script || !/-hook\.[cm]?js$/.test(script)) return undefined;
+  const jobFile = reflectJobFile(cacheFile);
+  return {
+    start(request) {
+      try {
+        writeReflectJob(jobFile, {
+          state: "pending",
+          startedAt: Date.now(),
+          request: { ...target, ...request },
+        });
+        const child = spawnFn(process.execPath, [script, REFLECT_WORKER_FLAG, jobFile], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        // spawn() failures often arrive asynchronously as an 'error' event; unhandled, that would
+        // crash the hook. The job then never resolves and is dropped once it is too old.
+        child.on("error", () => {});
+        child.unref();
+        return true;
+      } catch {
+        clearReflectJob(jobFile);
+        return false;
+      }
+    },
+    read: () => readReflectJob(jobFile),
+    clear: () => clearReflectJob(jobFile),
+  };
+}
+
 /** Run one hook invocation: stdin event in, (maybe) an injection object on stdout. */
 export async function runHook(
   spec: HookSpec,
   makeClient: (opts: ClientOpts) => HookClient = (o) => new HindsightClient(o)
 ): Promise<void> {
+  // Worker mode comes first: it is this binary re-executed by `fileLateReflect`, with no stdin
+  // event to read and nothing to print.
+  if (process.argv[2] === REFLECT_WORKER_FLAG && process.argv[3]) {
+    return runReflectWorker(process.argv[3], makeClient);
+  }
   // Anti-recursion: the codebase survey's own headless session sets this so its hooks are a no-op.
   if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
 
@@ -453,7 +659,18 @@ export async function runHook(
     startBackgroundSeed(cwd, { limit: cfg.seedLimit, harness: spec.harness });
   }
 
-  const output = await buildHookOutput({ harness: spec.harness, prompt, cfg, client, cacheFile });
+  const output = await buildHookOutput({
+    harness: spec.harness,
+    prompt,
+    cfg,
+    client,
+    cacheFile,
+    lateReflect: fileLateReflect(cacheFile, {
+      harness: spec.harness,
+      apiUrl: cfg.apiUrl,
+      bank: bankId,
+    }),
+  });
   // Mid-session heal: a bank with ZERO pages means the engine never built it (e.g. the session
   // predates the install, so no SessionStart and the first-prompt net already passed). Fire the
   // idempotent engine — the per-bank lock makes repeats free while it builds.

@@ -3,7 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config";
-import { buildHookOutput, runHook } from "./hook";
+import {
+  buildHookOutput,
+  LATE_REFLECT_LEAD,
+  runHook,
+  runReflectWorker,
+  type LateReflect,
+} from "./hook";
+import { readReflectJob, writeReflectJob, type ReflectJob } from "./session-cache";
 import { diagFilePath } from "./diag";
 import { ReflectError } from "./hindsight";
 import { buildReflectQuery } from "./inject";
@@ -767,6 +774,180 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     expect(client.listPages).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("late reflect: a synthesis slower than the hook is delivered on a later prompt", () => {
+  /** An in-memory LateReflect whose "worker" the test resolves by hand. */
+  function fakeLate(started = true) {
+    let job: ReflectJob | undefined;
+    const late: LateReflect = {
+      start: vi.fn(() => {
+        if (started) job = { state: "pending", startedAt: Date.now() };
+        return started;
+      }),
+      read: () => job,
+      clear: vi.fn(() => {
+        job = undefined;
+      }),
+      pollMs: 2,
+    };
+    return {
+      late,
+      finish: (answer: string) => (job = { state: "ready", startedAt: Date.now(), answer, ms: 1 }),
+      fail: (error: string) => (job = { state: "failed", startedAt: Date.now(), error }),
+      age: (ms: number) => (job = { ...(job as ReflectJob), startedAt: Date.now() - ms }),
+    };
+  }
+  const cfg = () => resolveConfig({ reflectTimeoutMs: 40 });
+  const turn = (
+    late: LateReflect,
+    client: ReturnType<typeof makeClient>,
+    prompt = UNRELATED_PROMPT
+  ) =>
+    buildHookOutput({
+      harness: "claude-code",
+      prompt,
+      cfg: cfg(),
+      client,
+      cacheFile,
+      lateReflect: late,
+    });
+
+  it("an answer inside the timeout is injected on turn 1, exactly as an in-process reflect", async () => {
+    const worker = fakeLate();
+    const client = makeClient();
+    setTimeout(() => worker.finish("WORKER_ANSWER"), 10);
+    const out = await turn(worker.late, client);
+    expect(out.context).toContain("WORKER_ANSWER");
+    expect(out.context).not.toContain(LATE_REFLECT_LEAD);
+    expect(client.reflect).not.toHaveBeenCalled(); // the worker made the call
+    expect(worker.late.clear).toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectPending).toBeUndefined();
+  });
+
+  it("still running at the deadline: turn 1 falls back, turn 2 delivers it once, turn 3 is quiet", async () => {
+    const worker = fakeLate();
+    const client = makeClient({
+      searchKnowledgePages: vi.fn(async () => [
+        { id: "p1", name: "Uploader guide", snippet: "retry" },
+      ]),
+    });
+
+    const first = await turn(worker.late, client);
+    expect(first.context).toContain("Uploader guide"); // the retrieval fallback still serves turn 1
+    expect(first.context).not.toContain("WORKER_ANSWER");
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectPending).toBe(true);
+    expect(readFileSync(diagFilePath(), "utf8")).toContain('"event":"reflect_pending"');
+
+    worker.finish("WORKER_ANSWER");
+    const second = await turn(worker.late, client, "a follow-up prompt");
+    expect(second.context).toContain("WORKER_ANSWER");
+    expect(second.context).toContain(LATE_REFLECT_LEAD);
+    expect(second.notice).toContain("arrived late");
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectPending).toBeUndefined();
+
+    const third = await turn(worker.late, client, "another prompt");
+    expect(third.context ?? "").not.toContain("WORKER_ANSWER");
+    expect(worker.late.start).toHaveBeenCalledTimes(1); // never reflected a second time
+    expect(client.reflect).not.toHaveBeenCalled();
+  });
+
+  it("no fallback either: turn 1 says the memory is still being written", async () => {
+    const worker = fakeLate();
+    const first = await turn(worker.late, makeClient());
+    expect(first.context ?? "").not.toContain("<hindsight_memory>");
+    expect(first.notice).toContain("still being written");
+  });
+
+  it("stays pending across a turn the worker has not finished by", async () => {
+    const worker = fakeLate();
+    const client = makeClient();
+    await turn(worker.late, client);
+    const second = await turn(worker.late, client, "a follow-up prompt");
+    expect(second.context ?? "").not.toContain("WORKER_ANSWER");
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectPending).toBe(true);
+    worker.finish("WORKER_ANSWER");
+    const third = await turn(worker.late, client, "another prompt");
+    expect(third.context).toContain("WORKER_ANSWER");
+  });
+
+  it("a worker that fails, or dies without a word, is dropped — no injection, no retry", async () => {
+    for (const end of ["fail", "die"] as const) {
+      rmSync(cacheFile, { force: true });
+      const worker = fakeLate();
+      const client = makeClient();
+      await turn(worker.late, client);
+      if (end === "fail") worker.fail("HTTP 500");
+      else worker.age(10 * 60_000);
+      const second = await turn(worker.late, client, "a follow-up prompt");
+      expect(second.context ?? "").not.toContain("<hindsight_memory>");
+      expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectPending).toBeUndefined();
+      expect(worker.late.start).toHaveBeenCalledTimes(1);
+    }
+    expect(readFileSync(diagFilePath(), "utf8")).toContain('"event":"reflect_late_failed"');
+  });
+
+  it("a worker that fails inside the timeout is an ordinary reflect failure (fallback, retry budget)", async () => {
+    const worker = fakeLate();
+    const client = makeClient();
+    setTimeout(() => worker.fail("HTTP 500"), 5);
+    const out = await turn(worker.late, client);
+    expect(out.notice).toContain("no memory this turn");
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectPending).toBeUndefined();
+  });
+
+  it("a worker that cannot be started: the hook reflects in-process", async () => {
+    const worker = fakeLate(false);
+    const client = makeClient();
+    const out = await turn(worker.late, client);
+    expect(client.reflect).toHaveBeenCalledTimes(1);
+    expect(out.context).toContain("REFLECT_ANSWER");
+  });
+
+  describe("runReflectWorker", () => {
+    const request = {
+      harness: "claude-code",
+      apiUrl: "http://x",
+      bank: "b",
+      query: "Q",
+      budget: "low",
+    };
+
+    it("records the answer in the job file", async () => {
+      const jobFile = join(root, "job.json");
+      writeReflectJob(jobFile, { state: "pending", startedAt: 1, request });
+      const client = makeClient({ reflect: vi.fn(async () => "WORKER_ANSWER") });
+      await runReflectWorker(jobFile, () => client);
+      expect(client.reflect).toHaveBeenCalledWith("Q", { budget: "low", timeoutMs: 120_000 });
+      expect(readReflectJob(jobFile)).toMatchObject({ state: "ready", answer: "WORKER_ANSWER" });
+    });
+
+    it("records a failure with the status and timeout flag the hook's fallback rule reads", async () => {
+      const jobFile = join(root, "job.json");
+      writeReflectJob(jobFile, { state: "pending", startedAt: 1, request });
+      const client = makeClient({
+        reflect: vi.fn(async () => {
+          throw new ReflectError("HTTP 503", 503, false);
+        }),
+      });
+      await runReflectWorker(jobFile, () => client);
+      expect(readReflectJob(jobFile)).toMatchObject({
+        state: "failed",
+        status: 503,
+        timedOut: false,
+      });
+    });
+
+    it("does nothing for a job that is missing or already resolved", async () => {
+      const jobFile = join(root, "job.json");
+      const client = makeClient();
+      await runReflectWorker(jobFile, () => client);
+      writeReflectJob(jobFile, { state: "ready", startedAt: 1, answer: "DONE", request });
+      await runReflectWorker(jobFile, () => client);
+      expect(client.reflect).not.toHaveBeenCalled();
+      expect(readReflectJob(jobFile)?.answer).toBe("DONE");
+    });
   });
 });
 

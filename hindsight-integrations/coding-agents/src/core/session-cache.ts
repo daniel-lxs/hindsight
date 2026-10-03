@@ -18,7 +18,60 @@ export interface SessionCache {
   reflectAttempts?: number;
   /** SessionStart saw a new/empty bank; consume this on prompt one, then allow reflect. */
   deferInitialReflect?: boolean;
+  /** The first-prompt synthesis outlived its hook: a background worker is still writing it (or has
+   *  finished since) and a later prompt delivers it. See `ReflectJob`. */
+  reflectPending?: boolean;
   pages?: { atTurn: number; list: PageRef[] };
+}
+
+/**
+ * The first-prompt synthesis, run by a worker process that outlives the hook that started it.
+ *
+ * A hook has to exit for the user's turn to begin, and exiting used to abort the reflect request —
+ * so a synthesis one second slower than `reflectTimeoutMs` was computed by the server and thrown
+ * away. The worker keeps the request alive instead and leaves the answer here; the hook reads it
+ * if it lands inside the timeout, and otherwise a later prompt's hook picks it up.
+ *
+ * Its own file, like the retain cursor and for the same reason: the prompt hook rewrites the
+ * session cache as a fresh object, and two writers (hook and worker) must not share a record.
+ */
+export interface ReflectJob {
+  state: "pending" | "ready" | "failed";
+  /** Epoch ms the hook started the job — a pending job older than the worker can live is dead. */
+  startedAt: number;
+  /** What the worker needs to make the call. No token: the worker reloads config for that. */
+  request?: { harness: string; apiUrl: string; bank: string; query: string; budget: string };
+  answer?: string;
+  ms?: number;
+  error?: string;
+  status?: number;
+  timedOut?: boolean;
+}
+
+export function reflectJobFile(cacheFile: string): string {
+  return `${cacheFile}.reflect.json`;
+}
+
+export function readReflectJob(jobFile: string): ReflectJob | undefined {
+  try {
+    return JSON.parse(readFileSync(jobFile, "utf8")) as ReflectJob;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Throws on failure: a job that cannot be recorded must not be started (the hook falls back to
+ *  reflecting in-process). */
+export function writeReflectJob(jobFile: string, job: ReflectJob): void {
+  writeFileAtomic(jobFile, JSON.stringify(job));
+}
+
+export function clearReflectJob(jobFile: string): void {
+  try {
+    rmSync(jobFile, { force: true });
+  } catch {
+    /* best-effort: a leftover job file is a few bytes in the temp dir */
+  }
 }
 
 export function sessionCacheFile(harness: string, sessionId: string): string {
