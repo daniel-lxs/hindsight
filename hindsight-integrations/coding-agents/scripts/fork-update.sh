@@ -12,9 +12,13 @@ cd "$(dirname "$0")/.."
 RUNTIME="${HINDSIGHT_RUNTIME_DIR:-$HOME/.hindsight/coding-agents}"
 
 if [[ $# -ge 1 ]]; then
-  tag="integrations/coding-agents/$1"
-  git fetch --depth 1 upstream tag "$tag"
-  git rebase "$tag"
+  # The fork's commits sit on top of the release named in package.json. This checkout is shallow, so
+  # the two release tags share no history git can see: name the old base explicitly and replay only
+  # the fork's own commits onto the new one.
+  old="integrations/coding-agents/v$(node -p "require('./package.json').version")"
+  new="integrations/coding-agents/$1"
+  git fetch --depth 1 upstream tag "$old" tag "$new"
+  git rebase --onto "$new" "$old"
 fi
 
 npm ci --no-audit --no-fund
